@@ -1,3 +1,4 @@
+const { Resend } = require('resend');
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -160,7 +161,28 @@ app.post('/webhook', async (req, res) => {
     }
 
     console.log(`✅ New license: ${licenseKey} for ${email}`);
-    // TODO: add Resend email here
+    try {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      await resend.emails.send({
+        from: 'AI TL;DR <noreply@boltextensions.com>',
+        to: email,
+        subject: 'Your AI TL;DR License Key',
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#0f0f0f;color:#f5f0e8;border-radius:12px">
+            <h2 style="font-size:24px;margin-bottom:8px">⚡ You're all set!</h2>
+            <p style="color:#aaa;margin-bottom:24px">Thanks for purchasing AI TL;DR by Bolt Extensions.</p>
+            <p style="margin-bottom:8px">Your license key is:</p>
+            <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;font-family:monospace;font-size:20px;letter-spacing:0.1em;color:#f5d060;text-align:center">${licenseKey}</div>
+            <p style="color:#aaa;font-size:13px;margin-top:24px">Enter this in the AI TL;DR Chrome extension popup to activate it. Keep it safe — this key is yours forever.</p>
+            <p style="color:#555;font-size:11px;margin-top:32px">Bolt Extensions · boltextensions.com</p>
+          </div>
+        `
+      });
+      console.log(`📧 License email sent to ${email}`);
+    } catch (emailErr) {
+      console.error('Email send failed:', emailErr);
+      // Don't fail the whole webhook if email fails
+    }
   }
 
   res.json({ received: true });
@@ -168,4 +190,3 @@ app.post('/webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bolt Extensions backend running on port ${PORT}`));
-
