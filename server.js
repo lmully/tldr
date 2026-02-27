@@ -7,7 +7,6 @@ const crypto = require('crypto');
 
 const app = express();
 
-// ── Lazy-load clients ─────────────────────────────────────────────
 let _stripe, _supabase;
 
 function getStripe() {
@@ -23,12 +22,10 @@ function getSupabase() {
   return _supabase;
 }
 
-// ── CORS ──────────────────────────────────────────────────────────
 app.use(cors({ origin: (origin, cb) => cb(null, true) }));
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// ── Helpers ───────────────────────────────────────────────────────
 function generateLicenseKey() {
   const seg = () => crypto.randomBytes(3).toString('hex').toUpperCase();
   return `TLDR-${seg()}-${seg()}-${seg()}`;
@@ -45,33 +42,6 @@ async function verifyLicense(key) {
   return data;
 }
 
-async function sendLicenseEmail(email, licenseKey) {
-  try {
-    const { Resend } = require('resend');
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
-      from: 'AI TL;DR <noreply@boltextensions.com>',
-      to: email,
-      subject: 'Your AI TL;DR License Key',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#0f0f0f;color:#f5f0e8;border-radius:12px">
-          <h2 style="font-size:24px;margin-bottom:8px">⚡ You're all set!</h2>
-          <p style="color:#aaa;margin-bottom:24px">Thanks for purchasing AI TL;DR by Bolt Extensions.</p>
-          <p style="margin-bottom:8px">Your license key is:</p>
-          <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;font-family:monospace;font-size:20px;letter-spacing:0.1em;color:#f5d060;text-align:center">${licenseKey}</div>
-          <p style="color:#aaa;font-size:13px;margin-top:24px">Enter this in the AI TL;DR Chrome extension popup to activate it. Keep it safe — this key is yours forever.</p>
-          <p style="color:#555;font-size:11px;margin-top:32px">Bolt Extensions · boltextensions.com</p>
-        </div>
-      `
-    });
-    console.log(`📧 License email sent to ${email}`);
-  } catch (err) {
-    console.error('Email send failed:', err.message);
-    // Don't fail the webhook if email fails
-  }
-}
-
-// ── Health check ──────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -79,13 +49,11 @@ app.get('/', (req, res) => {
     env: {
       supabase: !!process.env.SUPABASE_URL,
       stripe: !!process.env.STRIPE_SECRET_KEY,
-      openrouter: !!process.env.OPENROUTER_API_KEY,
-      resend: !!process.env.RESEND_API_KEY
+      openrouter: !!process.env.OPENROUTER_API_KEY
     }
   });
 });
 
-// ── POST /summarise ───────────────────────────────────────────────
 app.post('/summarise', async (req, res) => {
   try {
     const { licenseKey, text, title } = req.body;
@@ -146,7 +114,6 @@ app.post('/summarise', async (req, res) => {
   }
 });
 
-// ── GET /verify ───────────────────────────────────────────────────
 app.get('/verify', async (req, res) => {
   try {
     const { key } = req.query;
@@ -159,7 +126,6 @@ app.get('/verify', async (req, res) => {
   }
 });
 
-// ── POST /webhook (Stripe) ────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const sig = req.headers['stripe-signature'];
@@ -179,7 +145,7 @@ app.post('/webhook', async (req, res) => {
       const email = session.customer_details?.email;
       const licenseKey = generateLicenseKey();
 
-      console.log(`💳 Payment completed for ${email}, generating license ${licenseKey}`);
+      console.log(`💳 Payment from ${email}`);
 
       const { error } = await getSupabase().from('licenses').insert({
         key: licenseKey,
@@ -194,8 +160,8 @@ app.post('/webhook', async (req, res) => {
         return res.status(500).json({ error: 'Failed to create license' });
       }
 
-      console.log(`✅ License saved to Supabase: ${licenseKey}`);
-      await sendLicenseEmail(email, licenseKey);
+      // Log license key so you can manually send it while email is being set up
+      console.log(`✅ LICENSE CREATED: ${licenseKey} for ${email}`);
     }
 
     res.json({ received: true });
@@ -203,6 +169,14 @@ app.post('/webhook', async (req, res) => {
     console.error('Webhook handler error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err.message, err.stack);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
 
 const PORT = process.env.PORT || 3000;
