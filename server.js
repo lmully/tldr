@@ -6,18 +6,28 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
 const app = express();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+
+// ── Lazy-load clients so missing env vars don't crash at startup ──
+let _stripe, _supabase;
+
+function getStripe() {
+  if (!_stripe) _stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+  return _stripe;
+}
+
+function getSupabase() {
+  if (!_supabase) _supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_KEY
+  );
+  return _supabase;
+}
 
 // ── CORS — allow requests from Chrome extensions ──────────────────
 app.use(cors({
-  origin: (origin, cb) => cb(null, true) // Chrome extensions have null origin
+  origin: (origin, cb) => cb(null, true)
 }));
 
-// ── Raw body needed for Stripe webhook signature verification ──────
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -27,9 +37,9 @@ function generateLicenseKey() {
   return `TLDR-${seg()}-${seg()}-${seg()}`;
 }
 
-// ── Helper: verify a license key exists and is active ─────────────
+// ── Helper: verify a license key ──────────────────────────────────
 async function verifyLicense(key) {
-  const { data, error } = await supabase
+  const { data, error } = await getSupabase()
     .from('licenses')
     .select('*')
     .eq('key', key)
@@ -39,24 +49,27 @@ async function verifyLicense(key) {
   return data;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// POST /summarise
-// Called by the Chrome extension with a license key + page text
-// ─────────────────────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Bolt Extensions — AI TL;DR Backend',
+    env: {
+      supabase: !!process.env.SUPABASE_URL,
+      stripe: !!process.env.STRIPE_SECRET_KEY,
+      openrouter: !!process.env.OPENROUTER_API_KEY
+    }
+  });
+});
+
+// ── POST /summarise ───────────────────────────────────────────────
 app.post('/summarise', async (req, res) => {
   const { licenseKey, text, title } = req.body;
+  if (!licenseKey || !text) return res.status(400).json({ error: 'Missing licenseKey or text' });
 
-  if (!licenseKey || !text) {
-    return res.status(400).json({ error: 'Missing licenseKey or text' });
-  }
-
-  // 1. Verify license
   const license = await verifyLicense(licenseKey);
-  if (!license) {
-    return res.status(403).json({ error: 'INVALID_LICENSE' });
-  }
+  if (!license) return res.status(403).json({ error: 'INVALID_LICENSE' });
 
-  // 2. Call OpenRouter
   try {
     const trimmed = text.slice(0, 6000);
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -84,10 +97,7 @@ app.post('/summarise', async (req, res) => {
   "readTime": "X min read"
 }`
           },
-          {
-            role: 'user',
-            content: `Page title: ${title}\n\nPage content:\n${trimmed}`
-          }
+          { role: 'user', content: `Page title: ${title}\n\nPage content:\n${trimmed}` }
         ]
       })
     });
@@ -101,24 +111,19 @@ app.post('/summarise', async (req, res) => {
     const raw = data.choices[0].message.content.trim()
       .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
 
-    // 3. Log usage (optional — useful for monitoring)
-    await supabase.from('usage').insert({
+    await getSupabase().from('usage').insert({
       license_key: licenseKey,
       created_at: new Date().toISOString()
     });
 
     return res.json({ result: JSON.parse(raw) });
-
   } catch (err) {
     console.error('Summarise error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// GET /verify?key=TLDR-XXXX-XXXX-XXXX
-// Called by extension on startup to check if license is still valid
-// ─────────────────────────────────────────────────────────────────
+// ── GET /verify ───────────────────────────────────────────────────
 app.get('/verify', async (req, res) => {
   const { key } = req.query;
   if (!key) return res.status(400).json({ valid: false });
@@ -126,22 +131,13 @@ app.get('/verify', async (req, res) => {
   res.json({ valid: !!license });
 });
 
-// ─────────────────────────────────────────────────────────────────
-// POST /webhook  (Stripe)
-// Fires when a user completes a one-time payment
-// ─────────────────────────────────────────────────────────────────
+// ── POST /webhook (Stripe) ────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = getStripe().webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('Webhook signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -150,10 +146,9 @@ app.post('/webhook', async (req, res) => {
     const email = session.customer_details?.email;
     const licenseKey = generateLicenseKey();
 
-    // Save license to Supabase
-    const { error } = await supabase.from('licenses').insert({
+    const { error } = await getSupabase().from('licenses').insert({
       key: licenseKey,
-      email: email,
+      email,
       stripe_session_id: session.id,
       active: true,
       created_at: new Date().toISOString()
@@ -164,20 +159,13 @@ app.post('/webhook', async (req, res) => {
       return res.status(500).json({ error: 'Failed to create license' });
     }
 
-    // Send license key email via Stripe (or log it for now)
-    console.log(`✅ New license created: ${licenseKey} for ${email}`);
-
-    // TODO: Send email with licenseKey to the customer
-    // You can use Resend, SendGrid, or Postmark for this
+    console.log(`✅ New license: ${licenseKey} for ${email}`);
+    // TODO: add Resend email here
   }
 
   res.json({ received: true });
 });
 
-// ─────────────────────────────────────────────────────────────────
-// Health check
-// ─────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'AI TL;DR Backend' }));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Bolt Extensions backend running on port ${PORT}`));
+
