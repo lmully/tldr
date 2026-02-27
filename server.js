@@ -1,4 +1,3 @@
-const { Resend } = require('resend');
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,7 +7,7 @@ const crypto = require('crypto');
 
 const app = express();
 
-// ── Lazy-load clients so missing env vars don't crash at startup ──
+// ── Lazy-load clients ─────────────────────────────────────────────
 let _stripe, _supabase;
 
 function getStripe() {
@@ -24,21 +23,17 @@ function getSupabase() {
   return _supabase;
 }
 
-// ── CORS — allow requests from Chrome extensions ──────────────────
-app.use(cors({
-  origin: (origin, cb) => cb(null, true)
-}));
-
+// ── CORS ──────────────────────────────────────────────────────────
+app.use(cors({ origin: (origin, cb) => cb(null, true) }));
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// ── Helper: generate a license key ────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────
 function generateLicenseKey() {
   const seg = () => crypto.randomBytes(3).toString('hex').toUpperCase();
   return `TLDR-${seg()}-${seg()}-${seg()}`;
 }
 
-// ── Helper: verify a license key ──────────────────────────────────
 async function verifyLicense(key) {
   const { data, error } = await getSupabase()
     .from('licenses')
@@ -50,6 +45,32 @@ async function verifyLicense(key) {
   return data;
 }
 
+async function sendLicenseEmail(email, licenseKey) {
+  try {
+    const { Resend } = require('resend');
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({
+      from: 'AI TL;DR <noreply@boltextensions.com>',
+      to: email,
+      subject: 'Your AI TL;DR License Key',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#0f0f0f;color:#f5f0e8;border-radius:12px">
+          <h2 style="font-size:24px;margin-bottom:8px">⚡ You're all set!</h2>
+          <p style="color:#aaa;margin-bottom:24px">Thanks for purchasing AI TL;DR by Bolt Extensions.</p>
+          <p style="margin-bottom:8px">Your license key is:</p>
+          <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;font-family:monospace;font-size:20px;letter-spacing:0.1em;color:#f5d060;text-align:center">${licenseKey}</div>
+          <p style="color:#aaa;font-size:13px;margin-top:24px">Enter this in the AI TL;DR Chrome extension popup to activate it. Keep it safe — this key is yours forever.</p>
+          <p style="color:#555;font-size:11px;margin-top:32px">Bolt Extensions · boltextensions.com</p>
+        </div>
+      `
+    });
+    console.log(`📧 License email sent to ${email}`);
+  } catch (err) {
+    console.error('Email send failed:', err.message);
+    // Don't fail the webhook if email fails
+  }
+}
+
 // ── Health check ──────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
@@ -58,20 +79,21 @@ app.get('/', (req, res) => {
     env: {
       supabase: !!process.env.SUPABASE_URL,
       stripe: !!process.env.STRIPE_SECRET_KEY,
-      openrouter: !!process.env.OPENROUTER_API_KEY
+      openrouter: !!process.env.OPENROUTER_API_KEY,
+      resend: !!process.env.RESEND_API_KEY
     }
   });
 });
 
 // ── POST /summarise ───────────────────────────────────────────────
 app.post('/summarise', async (req, res) => {
-  const { licenseKey, text, title } = req.body;
-  if (!licenseKey || !text) return res.status(400).json({ error: 'Missing licenseKey or text' });
-
-  const license = await verifyLicense(licenseKey);
-  if (!license) return res.status(403).json({ error: 'INVALID_LICENSE' });
-
   try {
+    const { licenseKey, text, title } = req.body;
+    if (!licenseKey || !text) return res.status(400).json({ error: 'Missing licenseKey or text' });
+
+    const license = await verifyLicense(licenseKey);
+    if (!license) return res.status(403).json({ error: 'INVALID_LICENSE' });
+
     const trimmed = text.slice(0, 6000);
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -126,66 +148,61 @@ app.post('/summarise', async (req, res) => {
 
 // ── GET /verify ───────────────────────────────────────────────────
 app.get('/verify', async (req, res) => {
-  const { key } = req.query;
-  if (!key) return res.status(400).json({ valid: false });
-  const license = await verifyLicense(key);
-  res.json({ valid: !!license });
+  try {
+    const { key } = req.query;
+    if (!key) return res.status(400).json({ valid: false });
+    const license = await verifyLicense(key);
+    res.json({ valid: !!license });
+  } catch (err) {
+    console.error('Verify error:', err);
+    res.status(500).json({ valid: false });
+  }
 });
 
 // ── POST /webhook (Stripe) ────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
   try {
-    event = getStripe().webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+    const sig = req.headers['stripe-signature'];
+    let event;
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const email = session.customer_details?.email;
-    const licenseKey = generateLicenseKey();
-
-    const { error } = await getSupabase().from('licenses').insert({
-      key: licenseKey,
-      email,
-      stripe_session_id: session.id,
-      active: true,
-      created_at: new Date().toISOString()
-    });
-
-    if (error) {
-      console.error('Supabase insert error:', error);
-      return res.status(500).json({ error: 'Failed to create license' });
-    }
-
-    console.log(`✅ New license: ${licenseKey} for ${email}`);
     try {
-      const resend = new Resend(process.env.RESEND_API_KEY);
-      await resend.emails.send({
-        from: 'AI TL;DR <noreply@boltextensions.com>',
-        to: email,
-        subject: 'Your AI TL;DR License Key',
-        html: `
-          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#0f0f0f;color:#f5f0e8;border-radius:12px">
-            <h2 style="font-size:24px;margin-bottom:8px">⚡ You're all set!</h2>
-            <p style="color:#aaa;margin-bottom:24px">Thanks for purchasing AI TL;DR by Bolt Extensions.</p>
-            <p style="margin-bottom:8px">Your license key is:</p>
-            <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px;font-family:monospace;font-size:20px;letter-spacing:0.1em;color:#f5d060;text-align:center">${licenseKey}</div>
-            <p style="color:#aaa;font-size:13px;margin-top:24px">Enter this in the AI TL;DR Chrome extension popup to activate it. Keep it safe — this key is yours forever.</p>
-            <p style="color:#555;font-size:11px;margin-top:32px">Bolt Extensions · boltextensions.com</p>
-          </div>
-        `
-      });
-      console.log(`📧 License email sent to ${email}`);
-    } catch (emailErr) {
-      console.error('Email send failed:', emailErr);
-      // Don't fail the whole webhook if email fails
+      event = getStripe().webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('Webhook signature error:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
     }
-  }
 
-  res.json({ received: true });
+    console.log(`📩 Webhook received: ${event.type}`);
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const email = session.customer_details?.email;
+      const licenseKey = generateLicenseKey();
+
+      console.log(`💳 Payment completed for ${email}, generating license ${licenseKey}`);
+
+      const { error } = await getSupabase().from('licenses').insert({
+        key: licenseKey,
+        email,
+        stripe_session_id: session.id,
+        active: true,
+        created_at: new Date().toISOString()
+      });
+
+      if (error) {
+        console.error('Supabase insert error:', error);
+        return res.status(500).json({ error: 'Failed to create license' });
+      }
+
+      console.log(`✅ License saved to Supabase: ${licenseKey}`);
+      await sendLicenseEmail(email, licenseKey);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
